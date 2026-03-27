@@ -1,2 +1,5 @@
 numpy
 trimesh
+rerun-sdk 
+plyfile
+gsplat
