@@ -48,8 +48,3 @@ python src/mesh_to_3dgs_tree.py --mesh path/to/model.obj --base-voxel-size 0.01 
 - 每层一个 ply：`output_tree/lod_level_XX_vox*.ply`
 - 树索引文件：`output_tree/tree_index.npz`
 
-## 动态 LOD 切换预览
-
-```
-python src/render_lod_cut_gui.py --tree-index path/to/.npz --lod-dir path/to/lods_dir --tau 0.05 --max-nodes 8000
-```
