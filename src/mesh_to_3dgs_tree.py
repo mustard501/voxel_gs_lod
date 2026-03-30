@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, cast
 
 import numpy as np
 
 import mesh_to_3dgs_lod as m
+from mesh_io import assert_material_mode_for_path
 from morton import morton3d_child_key, morton3d_encode, morton3d_parent_key
 
 
@@ -163,9 +164,15 @@ def _fit_gaussian_from_faces(
     face_indices: np.ndarray,
     centers: np.ndarray,  # (F,3)
     areas: np.ndarray,  # (F,)
-    normals: np.ndarray,  # (F,3)
-    colors: np.ndarray,  # (F,3)
+    normals_geom: np.ndarray,  # (F,3)
     vertices: np.ndarray,  # (F,3,3)
+    *,
+    material_mode: m.MaterialMode,
+    colors: Optional[np.ndarray] = None,
+    shading_normals: Optional[np.ndarray] = None,
+    basecolors: Optional[np.ndarray] = None,
+    metallic: Optional[np.ndarray] = None,
+    roughness: Optional[np.ndarray] = None,
 ) -> m.GaussianPrimitive:
     face_indices = np.asarray(face_indices, dtype=np.int64)
     w = areas[face_indices].astype(np.float64)
@@ -173,16 +180,41 @@ def _fit_gaussian_from_faces(
         raise ValueError("Empty face set for gaussian fit.")
 
     xyz = m.weighted_average(centers[face_indices], w)
-    normal = m.weighted_average(normals[face_indices], w)
-    normal = normal / (np.linalg.norm(normal) + EPS)
-
-    color = m.weighted_average(colors[face_indices], w)
-    color = np.clip(color, 0.0, 1.0)
-
     covariance = m.pca_covariance_from_faces(vertices[face_indices], w)
     opacity = 1.0
 
-    return m.GaussianPrimitive(xyz=xyz, normal=normal, color=color, covariance=covariance, opacity=opacity)
+    if material_mode == "sh":
+        if colors is None:
+            raise ValueError("SH fit requires colors array.")
+        normal = m.weighted_average(normals_geom[face_indices], w)
+        normal = normal / (np.linalg.norm(normal) + EPS)
+        sh_color = m.weighted_average(colors[face_indices], w)
+        sh_color = np.clip(sh_color, 0.0, 1.0)
+        return m.GaussianPrimitive(
+            xyz=xyz, normal=normal, covariance=covariance, opacity=opacity, sh_color=sh_color
+        )
+
+    if shading_normals is None or basecolors is None or metallic is None or roughness is None:
+        raise ValueError("BRDF fit requires shading_normals, basecolors, metallic, roughness.")
+    normal = m.weighted_average(shading_normals[face_indices], w)
+    normal = normal / (np.linalg.norm(normal) + EPS)
+    basecolor_srgb = m.weighted_average(basecolors[face_indices], w)
+    basecolor_srgb = np.clip(basecolor_srgb, 0.0, 1.0)
+    mt = metallic[face_indices]
+    rf = roughness[face_indices]
+    met = float(np.sum(mt * w) / (np.sum(w) + EPS))
+    rou = float(np.sum(rf * w) / (np.sum(w) + EPS))
+    met = float(np.clip(met, 0.0, 1.0))
+    rou = float(np.clip(rou, 0.0, 1.0))
+    return m.GaussianPrimitive(
+        xyz=xyz,
+        normal=normal,
+        covariance=covariance,
+        opacity=opacity,
+        basecolor_srgb=basecolor_srgb,
+        metallic=met,
+        roughness=rou,
+    )
 
 
 def build_tree_and_export(
@@ -190,6 +222,7 @@ def build_tree_and_export(
     out_dir: Path,
     *,
     base_voxel_size: float = 0.01,
+    use_sh: bool = False,
     bake_textures: bool = False,
     texture_samples: int = 256,
     ply_prefix: str = "lod",
@@ -197,17 +230,36 @@ def build_tree_and_export(
     if base_voxel_size <= 0:
         raise ValueError("base_voxel_size must be positive.")
 
+    assert_material_mode_for_path(mesh_path, use_sh=use_sh)
+    material_mode = cast(m.MaterialMode, "sh" if use_sh else "brdf")
+
     mesh = m.load_mesh(mesh_path)
-    ts = texture_samples if bake_textures else None
-    face_records = m.extract_face_records(mesh, texture_samples=ts)
+    face_records = m.extract_face_records(
+        mesh,
+        material_mode=material_mode,
+        texture_samples=texture_samples,
+        bake_textures=bake_textures and use_sh,
+    )
     if not face_records:
         raise ValueError("No valid face records extracted from mesh.")
 
     centers = np.stack([r.center for r in face_records], axis=0).astype(np.float64)
     areas = np.asarray([r.area for r in face_records], dtype=np.float64)
-    normals = np.stack([r.normal for r in face_records], axis=0).astype(np.float64)
-    colors = np.stack([r.color for r in face_records], axis=0).astype(np.float64)
+    normals_geom = np.stack([r.normal for r in face_records], axis=0).astype(np.float64)
     vertices = np.stack([r.vertices for r in face_records], axis=0).astype(np.float64)
+
+    colors: Optional[np.ndarray] = None
+    shading_normals: Optional[np.ndarray] = None
+    basecolors: Optional[np.ndarray] = None
+    metallic_arr: Optional[np.ndarray] = None
+    roughness_arr: Optional[np.ndarray] = None
+    if use_sh:
+        colors = np.stack([cast(np.ndarray, r.color) for r in face_records], axis=0).astype(np.float64)
+    else:
+        shading_normals = np.stack([r.shading_normal for r in face_records], axis=0).astype(np.float64)
+        basecolors = np.stack([r.basecolor_srgb for r in face_records], axis=0).astype(np.float64)
+        metallic_arr = np.array([r.metallic for r in face_records], dtype=np.float64)
+        roughness_arr = np.array([r.roughness for r in face_records], dtype=np.float64)
 
     bbox_min = centers.min(axis=0)
     rel = centers - bbox_min[None, :]
@@ -272,7 +324,17 @@ def build_tree_and_export(
             e = int(boundaries[node_i, 1])
             face_idx = order[s:e]
             g = _fit_gaussian_from_faces(
-                face_idx, centers=centers, areas=areas, normals=normals, colors=colors, vertices=vertices
+                face_idx,
+                centers=centers,
+                areas=areas,
+                normals_geom=normals_geom,
+                vertices=vertices,
+                material_mode=material_mode,
+                colors=colors,
+                shading_normals=shading_normals,
+                basecolors=basecolors,
+                metallic=metallic_arr,
+                roughness=roughness_arr,
             )
             gaussians.append(g)
             # 计算第l层的局部信息
@@ -294,7 +356,7 @@ def build_tree_and_export(
         # 导出第l层的高斯模型
         voxel_size_l = base_voxel_size * (2**l)
         ply_path = out_dir / f"{ply_prefix}_level_{l:02d}_vox{voxel_size_l:.6f}.ply"
-        m.write_3dgs_ply(ply_path, gaussians)
+        m.write_gaussian_ply(ply_path, gaussians, material_mode=material_mode)
         print(f"[Tree] level={l}/{root_level}, nodes={len(gaussians)} -> {ply_path}")
         # 当前生成高斯数
         global_offset += len(gaussians)
@@ -344,15 +406,20 @@ def main() -> None:
     )
     parser.add_argument("--out-dir", type=Path, required=True, help="Output directory.")
     parser.add_argument(
+        "--sh",
+        action="store_true",
+        help="Spherical harmonics PLY; required for OBJ. Default is BRDF (GLB/GLTF).",
+    )
+    parser.add_argument(
         "--bake-textures",
         action="store_true",
-        help="Use UV texture: per-face average via bilinear sampling (no vertex bake).",
+        help="(SH only) Per-face texture average for color.",
     )
     parser.add_argument(
         "--texture-samples",
         type=int,
         default=256,
-        help="Samples per face for texture averaging when --bake-textures (default 256).",
+        help="Samples per face: BRDF basecolor/normal integration or SH texture (default 256).",
     )
     parser.add_argument("--ply-prefix", type=str, default="lod", help="PLY filename prefix.")
     args = parser.parse_args()
@@ -361,6 +428,7 @@ def main() -> None:
         mesh_path=args.mesh,
         out_dir=args.out_dir,
         base_voxel_size=args.base_voxel_size,
+        use_sh=args.sh,
         bake_textures=args.bake_textures,
         texture_samples=args.texture_samples,
         ply_prefix=args.ply_prefix,
