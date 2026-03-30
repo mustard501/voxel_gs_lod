@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import trimesh
 
-from bake import bake_texture_to_vertices
+from bake import texture_face_mean_colors
 
 
 EPS = 1e-8
@@ -44,7 +44,9 @@ def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
 
 
 # 返回面片记录
-def extract_face_records(mesh: trimesh.Trimesh) -> List[FaceRecord]:
+def extract_face_records(
+    mesh: trimesh.Trimesh, *, texture_samples: Optional[int] = None
+) -> List[FaceRecord]:
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     tri = vertices[faces]  # (F, 3, 3)
@@ -54,7 +56,11 @@ def extract_face_records(mesh: trimesh.Trimesh) -> List[FaceRecord]:
     areas = 0.5 * np.linalg.norm(cross, axis=1)
     normals = cross / (np.linalg.norm(cross, axis=1, keepdims=True) + EPS)
 
-    face_colors = infer_face_colors(mesh, faces)
+    if texture_samples is not None and texture_samples > 0:
+        tex_colors = texture_face_mean_colors(mesh, faces, n_samples=texture_samples)
+        face_colors = tex_colors if tex_colors is not None else infer_face_colors(mesh, faces)
+    else:
+        face_colors = infer_face_colors(mesh, faces)
 
     records: List[FaceRecord] = []
     for i in range(faces.shape[0]):
@@ -144,8 +150,7 @@ def fit_voxel_gaussian(face_records: Sequence[FaceRecord]) -> GaussianPrimitive:
     normal = weighted_average(normals, areas)
     normal = normal / (np.linalg.norm(normal) + EPS)
 
-    # SH color uses voxel face average as requested.
-    color = np.mean(colors, axis=0)
+    color = weighted_average(colors, areas)
     color = np.clip(color, 0.0, 1.0)
 
     covariance = pca_covariance_from_faces(all_vertices, areas)
@@ -283,12 +288,11 @@ def export_lods(
     output_dir: Path,
     voxel_sizes: Iterable[float],
     bake_textures: bool,
+    texture_samples: int = 256,
 ) -> None:
-    if bake_textures:
-        mesh = bake_texture_to_vertices(str(mesh_path))
-    else:
-        mesh = load_mesh(mesh_path)
-    records = extract_face_records(mesh)
+    mesh = load_mesh(mesh_path)
+    ts = texture_samples if bake_textures else None
+    records = extract_face_records(mesh, texture_samples=ts)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for i, voxel_size in enumerate(voxel_sizes):
@@ -324,12 +328,24 @@ def main() -> None:
     parser.add_argument(
         "--bake-textures",
         action="store_true",
-        help="Bake MTL/UV textures into vertex colors before generating LODs.",
+        help="Use UV texture: per-face average via bilinear sampling (no vertex bake).",
+    )
+    parser.add_argument(
+        "--texture-samples",
+        type=int,
+        default=256,
+        help="Samples per face for texture averaging when --bake-textures (default 256).",
     )
     args = parser.parse_args()
 
     voxel_sizes = parse_voxel_sizes(args.voxel_sizes)
-    export_lods(args.mesh, args.out_dir, voxel_sizes, bake_textures=args.bake_textures)
+    export_lods(
+        args.mesh,
+        args.out_dir,
+        voxel_sizes,
+        bake_textures=args.bake_textures,
+        texture_samples=args.texture_samples,
+    )
 
 
 if __name__ == "__main__":

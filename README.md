@@ -9,9 +9,19 @@
 - 每个体素拟合一个高斯：
   - 位置：面片中心按面积加权平均。
   - 法线：面片法线按面积加权平均后归一化。
-  - 颜色（SH 的 DC 项）：体素内面片颜色均值。
+  - 颜色（SH 的 DC 项）：体素内各面片颜色按**面片面积**加权平均。
   - 协方差：体素内面片顶点做加权 PCA 得到。
 - 不同体素尺寸对应不同 LOD。
+
+### 带贴图（UV）的模型
+
+- 使用 `--bake-textures` 时，**不会**再把贴图 bake 到顶点色；而是在每个三角面的 UV 三角上**均匀采样**，对纹理做**双线性插值**取色，再对样本取平均，作为该面在贴图上的平均颜色（对表面颜色的面积积分近似）。
+- 可用 `--texture-samples` 指定每个面的采样数（默认 `256`），在精度与耗时之间权衡。
+- 若未开 `--bake-textures`，则优先使用 mesh 自带的顶点色 / 面片色；都没有时使用中性灰。
+
+### 单独导出「顶点已 bake 贴图」的 mesh
+
+脚本 `src/bake.py` 中的 `bake_texture_to_vertices` 仍可将贴图转为顶点色并导出 PLY，供其它工具使用；与上述 3DGS 导出管线独立。
 
 ## 安装
 
@@ -19,14 +29,22 @@
 pip install -r requirements.txt
 ```
 
-## 使用
+## 使用（多尺度 LOD）
 
 ```bash
 python src/mesh_to_3dgs_lod.py --mesh path/to/model.obj --voxel-sizes 0.01,0.02,0.04 --out-dir path/to/output_dir
 ```
-如果纹理只有贴图，需要添加参数将纹理bake进mesh
+
+带 UV 贴图时启用按面片纹理平均色：
+
 ```bash
---bake-textures
+python src/mesh_to_3dgs_lod.py --mesh path/to/model.obj --voxel-sizes 0.01,0.02,0.04 --out-dir path/to/output_dir --bake-textures
+```
+
+可选：提高每面采样数（例如 512）：
+
+```bash
+--texture-samples 512
 ```
 
 输出示例：
@@ -43,8 +61,9 @@ python src/mesh_to_3dgs_lod.py --mesh path/to/model.obj --voxel-sizes 0.01,0.02,
 python src/mesh_to_3dgs_tree.py --mesh path/to/model.obj --base-voxel-size 0.01 --out-dir path/to/output_dir --bake-textures
 ```
 
+同样支持 `--texture-samples`。树构建中每个节点的高斯颜色也是其包含面片颜色的**面积加权**平均。
+
 输出：
 
 - 每层一个 ply：`output_tree/lod_level_XX_vox*.ply`
 - 树索引文件：`output_tree/tree_index.npz`
-

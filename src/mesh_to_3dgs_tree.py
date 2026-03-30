@@ -176,8 +176,7 @@ def _fit_gaussian_from_faces(
     normal = m.weighted_average(normals[face_indices], w)
     normal = normal / (np.linalg.norm(normal) + EPS)
 
-    # Your current logic: SH DC uses unweighted face-color mean.
-    color = colors[face_indices].mean(axis=0)
+    color = m.weighted_average(colors[face_indices], w)
     color = np.clip(color, 0.0, 1.0)
 
     covariance = m.pca_covariance_from_faces(vertices[face_indices], w)
@@ -192,17 +191,15 @@ def build_tree_and_export(
     *,
     base_voxel_size: float = 0.01,
     bake_textures: bool = False,
+    texture_samples: int = 256,
     ply_prefix: str = "lod",
 ) -> LODTree:
     if base_voxel_size <= 0:
         raise ValueError("base_voxel_size must be positive.")
 
-    if bake_textures:
-        mesh = m.bake_texture_to_vertices(str(mesh_path))
-    else:
-        mesh = m.load_mesh(mesh_path)
-
-    face_records = m.extract_face_records(mesh)
+    mesh = m.load_mesh(mesh_path)
+    ts = texture_samples if bake_textures else None
+    face_records = m.extract_face_records(mesh, texture_samples=ts)
     if not face_records:
         raise ValueError("No valid face records extracted from mesh.")
 
@@ -349,7 +346,13 @@ def main() -> None:
     parser.add_argument(
         "--bake-textures",
         action="store_true",
-        help="Bake MTL/UV textures into vertex colors before fitting gaussians.",
+        help="Use UV texture: per-face average via bilinear sampling (no vertex bake).",
+    )
+    parser.add_argument(
+        "--texture-samples",
+        type=int,
+        default=256,
+        help="Samples per face for texture averaging when --bake-textures (default 256).",
     )
     parser.add_argument("--ply-prefix", type=str, default="lod", help="PLY filename prefix.")
     args = parser.parse_args()
@@ -359,6 +362,7 @@ def main() -> None:
         out_dir=args.out_dir,
         base_voxel_size=args.base_voxel_size,
         bake_textures=args.bake_textures,
+        texture_samples=args.texture_samples,
         ply_prefix=args.ply_prefix,
     )
 
