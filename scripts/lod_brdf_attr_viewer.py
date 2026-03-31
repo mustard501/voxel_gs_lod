@@ -343,18 +343,18 @@ def main() -> None:
     with dpg.window(label="Main", tag="win_main", width=args.w + 50, height=args.h + 280):
         dpg.add_image("render_tex", tag="img_view")
         dpg.add_separator()
-        dpg.add_text("显示属性（相机与 cut 不变，仅换 SH DC）")
+        dpg.add_text("Display attribute (camera and cut fixed, only change SH DC)")
         dpg.add_combo(
-            label="通道",
+            label="Channel",
             items=attr_items,
             default_value="basecolor",
             tag="combo_attr",
             width=200,
         )
         dpg.add_separator()
-        dpg.add_text("相机（球坐标，中心=场景均值）")
+        dpg.add_text("Camera (spherical around scene mean)")
         dpg.add_slider_float(
-            label="距离",
+            label="Distance",
             default_value=float(radius),
             min_value=r_min,
             max_value=r_max,
@@ -362,7 +362,7 @@ def main() -> None:
             tag="sl_radius",
         )
         dpg.add_slider_float(
-            label="水平角 θ（度）",
+            label="Azimuth theta (deg around Z)",
             default_value=0.0,
             min_value=-180.0,
             max_value=180.0,
@@ -370,7 +370,7 @@ def main() -> None:
             tag="sl_theta_deg",
         )
         dpg.add_slider_float(
-            label="俯仰角 φ（度）",
+            label="Polar phi (deg from +Z)",
             default_value=60.0,
             min_value=5.0,
             max_value=175.0,
@@ -475,7 +475,7 @@ def main() -> None:
         state["fps"] = 0.9 * state["fps"] + 0.1 * (1.0 / dt if dt > 1e-6 else 0.0)
         dpg.set_value(
             "txt_status",
-            f"属性={attr}  |  N={state['n_visible']}  |  r={cam_r:.3f}  tau={state['tau']:.4f}  |  ~{state['fps']:.1f} fps",
+            f"status={attr}  |  N={state['n_visible']}  |  r={cam_r:.3f}  tau={state['tau']:.4f}  |  ~{state['fps']:.1f} fps",
         )
         dpg.render_dearpygui_frame()
 
