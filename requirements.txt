@@ -3,3 +3,4 @@ trimesh
 tqdm
 rerun-sdk 
 plyfile
+dearpygui
