@@ -8,8 +8,7 @@ def convert_custom_ply_to_visuals(input_path):
     v = plydata['vertex']
     num_verts = len(v)
 
-    # 1. 定义转换逻辑
-    # 显式处理单列和多列的情况
+    # 转换逻辑
     tasks = [
         ("albedo", ['base_r', 'base_g', 'base_b'], lambda x: x),
         ("normal", ['nx', 'ny', 'nz'], lambda x: 0.5 * x + 0.5),
@@ -64,8 +63,7 @@ def convert_custom_ply_to_visuals(input_path):
         print(f"成功保存: {output_path}")
 
 if __name__ == "__main__":
-    # 替换为你的文件路径
-    input_file = "assets/outputs/2/lod_level_00_vox0.010000.ply" 
+    input_file = "assets/outputs/2/lod_level_04_vox0.160000.ply" 
     if os.path.exists(input_file):
         convert_custom_ply_to_visuals(input_file)
     else:
