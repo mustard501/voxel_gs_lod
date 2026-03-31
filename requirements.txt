@@ -3,4 +3,3 @@ trimesh
 tqdm
 rerun-sdk 
 plyfile
-gsplat
