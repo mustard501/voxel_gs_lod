@@ -94,7 +94,7 @@ def process_directory(input_dir):
 
 if __name__ == "__main__":
     # 在这里输入你的目标文件夹路径
-    target_directory = "assets/outputs/2" 
+    target_directory = "assets/outputs/3" 
     
     if os.path.exists(target_directory):
         process_directory(target_directory)

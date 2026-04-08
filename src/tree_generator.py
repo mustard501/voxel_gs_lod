@@ -42,7 +42,8 @@ def _finest_voxel_morton(
         groups[mk].append(records[t])
     return dict(groups)
 
-
+# 构建层级映射，返回一个列表，每个元素是一个字典，表示一层
+# 字典键为体素索引，值为该体素包含的face列表
 def _build_level_maps(
     finest: Dict[int, List[m.FaceRecord]],
 ) -> List[Dict[int, List[m.FaceRecord]]]:
@@ -117,6 +118,7 @@ def build_tree_and_export(
     assert_material_mode_for_path(mesh_path, use_sh=use_sh)
     material_mode = cast(m.MaterialMode, "sh" if use_sh else "brdf")
 
+    # 加载mesh
     mesh = m.load_mesh(mesh_path)
     face_records = m.extract_face_records(
         mesh,
@@ -134,23 +136,28 @@ def build_tree_and_export(
     max_extent = int(ijk_rel.max()) + 1
     bits_per_axis = max(1, int(np.ceil(np.log2(max(max_extent, 1)))))
 
+    # 最精细层体素划分
     finest = _finest_voxel_morton(
         face_records, base_voxel_size, bits_per_axis=bits_per_axis, origin_ijk=imin
     )
     if not finest:
         raise ValueError("No voxels after Morton grouping (empty mesh?).")
 
+    # 构建层级映射
     level_maps = _build_level_maps(finest)
     root_level = len(level_maps) - 1
     root_key = next(iter(level_maps[root_level]))
 
+    # DFS遍历，构建平铺节点
     flat = _dfs_flat_nodes(level_maps, root_level=root_level, root_key=root_key)
     n_nodes = len(flat)
 
+    # 逐节点拟合，返回所有高斯列表
     gaussians: List[m.GaussianPrimitive] = [
         m.fit_voxel_gaussian(node.records, material_mode=material_mode) for node in flat
     ]
 
+    # 按高斯列表的顺序将节点信息存入numpy数组
     parent = np.array([n.parent for n in flat], dtype=np.int32)
     child_begin = np.array([n.child_begin for n in flat], dtype=np.int32)
     child_count = np.array([n.child_count for n in flat], dtype=np.int32)
@@ -168,6 +175,7 @@ def build_tree_and_export(
     opacity = np.array([g.opacity for g in gaussians], dtype=np.float32)
     normals = np.stack([g.normal for g in gaussians], axis=0).astype(np.float32)
 
+    # 保存到文件
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
