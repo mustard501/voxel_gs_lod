@@ -11,6 +11,21 @@ from trimesh.visual.material import PBRMaterial
 EPS = 1e-8
 
 
+def srgb_to_linear_rgb(rgb: np.ndarray) -> np.ndarray:
+    """sRGB 编码 RGB（0–1）→ 线性光 RGB。IEC 61966-2-1 分段。"""
+    c = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)
+    low = c <= 0.04045
+    return np.where(low, c / 12.92, np.power((c + 0.055) / 1.055, 2.4))
+
+
+def linear_to_srgb_rgb(rgb: np.ndarray) -> np.ndarray:
+    """线性光 RGB（0–1）→ sRGB 编码。"""
+    c = np.clip(np.asarray(rgb, dtype=np.float64), 0.0, 1.0)
+    low = c <= 0.0031308
+    out = np.where(low, 12.92 * c, 1.055 * np.power(c, 1.0 / 2.4) - 0.055)
+    return np.clip(out, 0.0, 1.0)
+
+
 def _barycentric_weights(n_samples: int, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     r1 = rng.random(n_samples)
     r2 = rng.random(n_samples)
@@ -31,6 +46,7 @@ def _integrate_image_per_face(
     max_uv_per_batch: int = 262_144,
     desc: str = "PBR 采样",
     show_progress: bool = True,
+    srgb_rgb_linear_filter: bool = False,
 ) -> Optional[np.ndarray]:
     """Per-face mean of bilinear-sampled image channels at random UV points (F, C). C = sampled channels."""
     if n_samples <= 0 or image is None:
@@ -64,15 +80,26 @@ def _integrate_image_per_face(
             + l3[np.newaxis, :, np.newaxis] * uv_b[:, 2:3, :]
         )
         flat = uv_samples.reshape(-1, 2)
-        rgba = _bilinear_rgba(flat, img_rgba, w, h)
+        rgba = _bilinear_rgba(flat, img_rgba, w, h, srgb_rgb_filter=srgb_rgb_linear_filter)
         mean_ch[start:end] = rgba.reshape(b, n_samples, 4).mean(axis=1)
 
     return mean_ch
 
-# 双线性插值 
-# 当采样点uv坐标不在像素中心时，使用周围四个像素做插值
-def _bilinear_rgba(uv: np.ndarray, img_rgba: np.ndarray, w: int, h: int) -> np.ndarray:
-    """uv (N,2) in [0,1]-style; same convention as trimesh (v flipped). Returns (N,4)."""
+# 双线性插值
+# 当采样点 uv 不在像素中心时，用周围四像素加权；可选对 RGB 在线性光空间插值（baseColor）。
+def _bilinear_rgba(
+    uv: np.ndarray,
+    img_rgba: np.ndarray,
+    w: int,
+    h: int,
+    *,
+    srgb_rgb_filter: bool = False,
+) -> np.ndarray:
+    """uv (N,2) in [0,1]-style; same convention as trimesh (v flipped). Returns (N,4).
+
+    srgb_rgb_filter: 为 True 时，RGB 四角先 sRGB→linear，双线性后再 linear→sRGB；
+    A 通道始终按线性量插值（glTF baseColor alpha 为线性）。
+    """
     x = uv[:, 0] * (w - 1)
     y = (1.0 - uv[:, 1]) * (h - 1)
     x0 = np.floor(x).astype(np.int64) % w
@@ -91,12 +118,33 @@ def _bilinear_rgba(uv: np.ndarray, img_rgba: np.ndarray, w: int, h: int) -> np.n
     a01 = dx * (1 - dy)
     a10 = (1 - dx) * dy
     a11 = dx * dy
-    return (
-        c00 * a00[:, None]
-        + c01 * a01[:, None]
-        + c10 * a10[:, None]
-        + c11 * a11[:, None]
+
+    if not srgb_rgb_filter:
+        return (
+            c00 * a00[:, None]
+            + c01 * a01[:, None]
+            + c10 * a10[:, None]
+            + c11 * a11[:, None]
+        )
+
+    lin00 = srgb_to_linear_rgb(c00[:, :3])
+    lin01 = srgb_to_linear_rgb(c01[:, :3])
+    lin10 = srgb_to_linear_rgb(c10[:, :3])
+    lin11 = srgb_to_linear_rgb(c11[:, :3])
+    rgb_lin = (
+        lin00 * a00[:, None]
+        + lin01 * a01[:, None]
+        + lin10 * a10[:, None]
+        + lin11 * a11[:, None]
     )
+    rgb_out = linear_to_srgb_rgb(np.clip(rgb_lin, 0.0, 1.0))
+    alpha = (
+        c00[:, 3] * a00
+        + c01[:, 3] * a01
+        + c10[:, 3] * a10
+        + c11[:, 3] * a11
+    )
+    return np.concatenate([rgb_out, np.clip(alpha, 0.0, 1.0)[:, None]], axis=1)
 
 
 def face_constant_tbn(
@@ -144,7 +192,7 @@ def pbr_face_basecolor_srgb_integrated(
     max_uv_per_batch: int = 262_144,
     show_progress: bool = True,
 ) -> np.ndarray:
-    """Per-face base color in sRGB 0–1 (texture texels treated as sRGB)."""
+    """Per-face base color in sRGB 0–1；贴图 RGB 按 sRGB 解码后在线性空间双线性，再编码回 sRGB。"""
     mat = mesh.visual.material if mesh.visual else None
     uv = getattr(mesh.visual, "uv", None) if mesh.visual else None
     if uv is None or len(uv) != len(mesh.vertices):
@@ -161,6 +209,7 @@ def pbr_face_basecolor_srgb_integrated(
                 max_uv_per_batch=max_uv_per_batch,
                 desc="BaseColor 积分",
                 show_progress=show_progress,
+                srgb_rgb_linear_filter=True,
             )
             if ch is None:
                 raise ValueError("Failed to sample baseColorTexture.")
