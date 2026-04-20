@@ -60,46 +60,62 @@ def _build_level_maps(
     return levels
 
 
-def _dfs_flat_nodes(
+def _flatten_level_order(
     level_maps: List[Dict[int, List[m.FaceRecord]]],
     *,
     root_level: int,
-    root_key: int,
 ) -> List[_NodeBuild]:
-    """Pre-order DFS; children are contiguous [child_begin, child_begin + child_count)."""
+    """Flatten by level and parent group so direct children stay contiguous."""
+    ordered_keys: Dict[int, List[int]] = {}
+    for l in range(root_level, -1, -1):
+        if l == root_level:
+            keys = sorted(int(k) for k in level_maps[l].keys())
+        else:
+            keys = sorted(
+                (int(k) for k in level_maps[l].keys()),
+                key=lambda k: (morton3d_parent_key(k), k),
+            )
+        ordered_keys[l] = keys
 
-    buf: List[_NodeBuild] = []
+    key_to_gid: Dict[Tuple[int, int], int] = {}
+    gid = 0
+    for l in range(root_level, -1, -1):
+        for k in ordered_keys[l]:
+            key_to_gid[(l, k)] = gid
+            gid += 1
 
-    def visit(key: int, lod_level: int, parent_id: int) -> None:
-        recs = level_maps[lod_level][key]
-        my_id = len(buf)
-        buf.append(
-            _NodeBuild(
+    out: List[_NodeBuild] = [
+        _NodeBuild(parent=-1, level=0, morton_key=0, records=[], child_begin=-1, child_count=0)
+        for _ in range(gid)
+    ]
+    for l in range(root_level, -1, -1):
+        for k in ordered_keys[l]:
+            me = key_to_gid[(l, k)]
+            parent_id = -1 if l == root_level else key_to_gid[(l + 1, morton3d_parent_key(k))]
+            out[me] = _NodeBuild(
                 parent=parent_id,
-                level=lod_level,
-                morton_key=int(key),
-                records=recs,
+                level=l,
+                morton_key=k,
+                records=level_maps[l][k],
                 child_begin=-1,
                 child_count=0,
             )
-        )
-        if lod_level == 0:
-            return
-        child_keys = [
-            morton3d_child_key(int(key), o)
-            for o in range(8)
-            if morton3d_child_key(int(key), o) in level_maps[lod_level - 1]
-        ]
-        child_keys.sort()
-        if not child_keys:
-            return
-        buf[my_id].child_begin = my_id + 1
-        buf[my_id].child_count = len(child_keys)
-        for ck in child_keys:
-            visit(ck, lod_level - 1, my_id)
 
-    visit(root_key, root_level, -1)
-    return buf
+    for l in range(root_level, 0, -1):
+        finer = ordered_keys[l - 1]
+        if not finer:
+            continue
+        i = 0
+        while i < len(finer):
+            pk = morton3d_parent_key(finer[i])
+            j = i + 1
+            while j < len(finer) and morton3d_parent_key(finer[j]) == pk:
+                j += 1
+            parent_id = key_to_gid[(l, pk)]
+            out[parent_id].child_begin = key_to_gid[(l - 1, finer[i])]
+            out[parent_id].child_count = j - i
+            i = j
+    return out
 
 
 def build_tree_and_export(
@@ -146,10 +162,8 @@ def build_tree_and_export(
     # 构建层级映射
     level_maps = _build_level_maps(finest)
     root_level = len(level_maps) - 1
-    root_key = next(iter(level_maps[root_level]))
-
-    # DFS遍历，构建平铺节点
-    flat = _dfs_flat_nodes(level_maps, root_level=root_level, root_key=root_key)
+    # 按层+父节点分组顺序平铺，确保 child_begin + child_count 连续
+    flat = _flatten_level_order(level_maps, root_level=root_level)
     n_nodes = len(flat)
 
     # 逐节点拟合，返回所有高斯列表

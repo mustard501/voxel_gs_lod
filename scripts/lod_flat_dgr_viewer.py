@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """
-使用 diff_gaussian_rasterization（submodules）实时渲染，并按 LODTree.cut_by_distance
-返回的全局节点索引，从各层 PLY 中 gather 高斯子集。
+Render flat hierarchy (tree_index_flat.npz) with BRDF-attribute PLY + Dear PyGui.
 
-可视化：Dear PyGui
-
-依赖:
-  - torch + CUDA, diff_gaussian_rasterization
-  - plyfile, dearpygui, numpy
-
-输入目录需包含:
-  - tree_index.npz（mesh_to_3dgs_tree 输出）
-  - lod_level_00_*.ply … lod_level_L_*.ply（与 npz 层数一致，球谐 f_dc PLY）
-
-用法:
-  python scripts/lod_dgr_viewer.py --lod-dir path/to/tree_output
-
-界面滑块：相机距离、水平角 θ、俯仰角 φ（度）、cut 阈值 tau。
+- Tree traversal uses child_begin + child_count.
+- LOD cut is camera-distance based: refine if (voxel_size(level) / dist(node, cam)) > tau.
+- Camera/cut stay fixed while switching view channel:
+  basecolor / normal / metallic / roughness.
+- Selected attribute is converted to SH-DC by:
+  src_data = (src_data - 0.5) / 0.28209
 """
 
 from __future__ import annotations
@@ -24,30 +15,23 @@ from __future__ import annotations
 import argparse
 import math
 import re
-import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# -----------------------------------------------------------------------------
-# 工程内 LOD 树（cut_by_distance）
-# -----------------------------------------------------------------------------
-def _src_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "src"
+SH_C0 = 0.28209
+ATTR_KEYS = {
+    "basecolor": "sh_basecolor",
+    "normal": "sh_normal",
+    "metallic": "sh_metallic",
+    "roughness": "sh_roughness",
+}
 
 
-if str(_src_dir()) not in sys.path:
-    sys.path.insert(0, str(_src_dir()))
-
-from mesh_to_3dgs_tree import LODTree  # noqa: E402
-
-
-# -----------------------------------------------------------------------------
-# 相机矩阵（与 graphdeco-inria/gaussian-splatting 一致）
-# -----------------------------------------------------------------------------
 def get_world2view2(
     r: np.ndarray,
     t: np.ndarray,
@@ -125,10 +109,77 @@ def build_camera_tensors(
     return wvt, full_proj, cam_center
 
 
-# -----------------------------------------------------------------------------
-# PLY → GPU（球谐）
-# -----------------------------------------------------------------------------
-def load_sh_ply_gaussians(ply_path: Path, device: "torch.device") -> Dict[str, "torch.Tensor"]:
+@dataclass
+class FlatTree:
+    parent: np.ndarray
+    child_begin: np.ndarray
+    child_count: np.ndarray
+    level: np.ndarray
+    node_xyz: np.ndarray
+    base_voxel_size: float
+    root_level: int
+    root_index: int
+    node_to_level_local: np.ndarray
+
+    @staticmethod
+    def load(path: Path) -> "FlatTree":
+        d = np.load(path, allow_pickle=False)
+        parent = d["parent"].astype(np.int32)
+        child_begin = d["child_begin"].astype(np.int32)
+        child_count = d["child_count"].astype(np.int32)
+        level = d["level"].astype(np.int32)
+        node_xyz = d["node_xyz"].astype(np.float32)
+        base_voxel_size = float(d["base_voxel_size"][0])
+        root_level = int(d["root_level"][0])
+        roots = np.flatnonzero(parent < 0)
+        if roots.size != 1:
+            raise ValueError(f"tree_index_flat expects one root, got {roots.size}")
+        root_index = int(roots[0])
+
+        node_to_level_local = np.full(parent.shape[0], -1, dtype=np.int32)
+        for l in range(root_level + 1):
+            ids = np.flatnonzero(level == l)
+            node_to_level_local[ids] = np.arange(ids.shape[0], dtype=np.int32)
+        if np.any(node_to_level_local < 0):
+            raise ValueError("node_to_level_local has invalid entries")
+
+        return FlatTree(
+            parent=parent,
+            child_begin=child_begin,
+            child_count=child_count,
+            level=level,
+            node_xyz=node_xyz,
+            base_voxel_size=base_voxel_size,
+            root_level=root_level,
+            root_index=root_index,
+            node_to_level_local=node_to_level_local,
+        )
+
+    def cut_by_distance(self, camera_position: np.ndarray, tau: float = 0.05) -> List[int]:
+        cam = np.asarray(camera_position, dtype=np.float64).reshape(3)
+        out: List[int] = []
+        stack: List[int] = [self.root_index]
+        while stack:
+            nid = int(stack.pop())
+            l = int(self.level[nid])
+            d = float(np.linalg.norm(self.node_xyz[nid].astype(np.float64) - cam) + 1e-8)
+            voxel_size = float(self.base_voxel_size * (2**l))
+            begin = int(self.child_begin[nid])
+            count = int(self.child_count[nid])
+            refine = (voxel_size / d) > tau and count > 0 and begin >= 0
+            if refine:
+                for cid in range(begin + count - 1, begin - 1, -1):
+                    stack.append(cid)
+            else:
+                out.append(nid)
+        return out
+
+
+def _to_sh_dc(src_data: np.ndarray) -> np.ndarray:
+    return ((src_data - 0.5) / SH_C0).astype(np.float32)
+
+
+def load_brdf_ply_multiview(ply_path: Path, device: "torch.device") -> Dict[str, "torch.Tensor"]:
     import torch
     from plyfile import PlyData
 
@@ -139,9 +190,14 @@ def load_sh_ply_gaussians(ply_path: Path, device: "torch.device") -> Dict[str, "
         "x",
         "y",
         "z",
-        "f_dc_0",
-        "f_dc_1",
-        "f_dc_2",
+        "base_r",
+        "base_g",
+        "base_b",
+        "nx",
+        "ny",
+        "nz",
+        "metallic",
+        "roughness",
         "opacity",
         "scale_0",
         "scale_1",
@@ -152,25 +208,33 @@ def load_sh_ply_gaussians(ply_path: Path, device: "torch.device") -> Dict[str, "
         "rot_3",
     }
     if not need.issubset(names):
-        miss = need - names
-        raise ValueError(
-            f"{ply_path}: 缺少球谐 PLY 字段 {miss}。"
-            "请使用 --sh 导出或使用 convert.py 将 BRDF 转为伪 f_dc。"
-        )
+        miss = sorted(need - names)
+        raise ValueError(f"{ply_path}: missing BRDF fields {miss}")
 
     xyz = np.stack([v["x"], v["y"], v["z"]], axis=1).astype(np.float32)
-    fdc = np.stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]], axis=1).astype(np.float32)
     op = np.asarray(v["opacity"], dtype=np.float32).reshape(-1, 1)
     sc = np.stack([v["scale_0"], v["scale_1"], v["scale_2"]], axis=1).astype(np.float32)
     rot = np.stack([v["rot_0"], v["rot_1"], v["rot_2"], v["rot_3"]], axis=1).astype(np.float32)
-    shs = fdc[:, None, :]
+    base = np.stack([v["base_r"], v["base_g"], v["base_b"]], axis=1).astype(np.float32)
+    nrm = np.stack([v["nx"], v["ny"], v["nz"]], axis=1).astype(np.float32)
+    n_vis = np.clip(0.5 * nrm + 0.5, 0.0, 1.0)
+    met = np.asarray(v["metallic"], dtype=np.float32).reshape(-1, 1)
+    rou = np.asarray(v["roughness"], dtype=np.float32).reshape(-1, 1)
+    met_rgb = np.repeat(met, 3, axis=1)
+    rou_rgb = np.repeat(rou, 3, axis=1)
+
+    def pack(sh_dc: np.ndarray) -> "torch.Tensor":
+        return torch.from_numpy(sh_dc[:, None, :]).to(device)
 
     return {
         "means3D": torch.from_numpy(xyz).to(device),
         "opacities": torch.from_numpy(op).to(device),
         "scales": torch.from_numpy(sc).to(device),
         "rotations": torch.from_numpy(rot).to(device),
-        "shs": torch.from_numpy(shs).to(device),
+        "sh_basecolor": pack(_to_sh_dc(base)),
+        "sh_normal": pack(_to_sh_dc(n_vis)),
+        "sh_metallic": pack(_to_sh_dc(met_rgb)),
+        "sh_roughness": pack(_to_sh_dc(rou_rgb)),
         "num": xyz.shape[0],
     }
 
@@ -181,56 +245,56 @@ def discover_lod_plies(lod_dir: Path) -> List[Path]:
     if not cands:
         cands = list(lod_dir.glob("lod_level_*.ply"))
     if not cands:
-        raise FileNotFoundError(f"未找到 lod_level_*.ply: {lod_dir}")
+        raise FileNotFoundError(f"no lod_level_*.ply in {lod_dir}")
 
-    def sort_key(p: Path) -> Tuple[int, str]:
+    def key(p: Path) -> Tuple[int, str]:
         m = pat.search(p.name)
-        lv = int(m.group(1)) if m else 999
+        lv = int(m.group(1)) if m else 10**9
         return (lv, p.name)
 
-    cands.sort(key=sort_key)
+    cands.sort(key=key)
     return cands
 
 
 def gather_gaussians_for_cut(
-    tree: LODTree,
+    tree: FlatTree,
     level_tensors: List[Dict[str, "torch.Tensor"]],
-    global_indices: List[int],
+    node_indices: List[int],
     device: "torch.device",
+    attr: str,
 ) -> Optional[Dict[str, "torch.Tensor"]]:
-    """按 cut_by_distance 的全局索引，从各层 PLY 张量中索引并拼接。"""
     import torch
 
-    if not global_indices:
+    if attr not in ATTR_KEYS:
+        raise ValueError(f"unknown attr: {attr}")
+    sh_key = ATTR_KEYS[attr]
+
+    if not node_indices:
         return None
 
     by_level: Dict[int, List[int]] = defaultdict(list)
-    for g in global_indices:
-        l, loc = tree.get_level_local_index(int(g))
-        by_level[int(l)].append(int(loc))
+    for nid in node_indices:
+        l = int(tree.level[nid])
+        loc = int(tree.node_to_level_local[nid])
+        by_level[l].append(loc)
 
-    parts_means = []
-    parts_op = []
-    parts_sc = []
-    parts_rot = []
-    parts_sh = []
-
+    pm, po, ps, pr, psh = [], [], [], [], []
     for l in sorted(by_level.keys()):
         idx = torch.tensor(by_level[l], device=device, dtype=torch.long)
         lt = level_tensors[l]
-        parts_means.append(lt["means3D"][idx])
-        parts_op.append(lt["opacities"][idx])
-        parts_sc.append(lt["scales"][idx])
-        parts_rot.append(lt["rotations"][idx])
-        parts_sh.append(lt["shs"][idx])
+        pm.append(lt["means3D"][idx])
+        po.append(lt["opacities"][idx])
+        ps.append(lt["scales"][idx])
+        pr.append(lt["rotations"][idx])
+        psh.append(lt[sh_key][idx])
 
     return {
-        "means3D": torch.cat(parts_means, dim=0),
-        "opacities": torch.cat(parts_op, dim=0),
-        "scales": torch.cat(parts_sc, dim=0),
-        "rotations": torch.cat(parts_rot, dim=0),
-        "shs": torch.cat(parts_sh, dim=0),
-        "num": int(sum(t.shape[0] for t in parts_means)),
+        "means3D": torch.cat(pm, dim=0),
+        "opacities": torch.cat(po, dim=0),
+        "scales": torch.cat(ps, dim=0),
+        "rotations": torch.cat(pr, dim=0),
+        "shs": torch.cat(psh, dim=0),
+        "num": int(sum(t.shape[0] for t in pm)),
     }
 
 
@@ -263,44 +327,38 @@ def main() -> None:
         from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
     except ImportError as e:
         raise SystemExit(
-            "无法导入 diff_gaussian_rasterization，请在 CUDA 环境下于 submodules 目录执行: pip install -e .\n"
+            "Cannot import diff_gaussian_rasterization. Run `pip install -e .` in submodules first.\n"
             f"{e}"
         ) from e
 
-    parser = argparse.ArgumentParser(description="cut_by_distance + Dear PyGui + diff_gaussian_rasterization")
-    parser.add_argument("--lod-dir", type=Path, required=True, help="含 tree_index.npz 与各层 lod_level_XX_*.ply")
-    parser.add_argument("--w", type=int, default=1280, help="渲染宽")
-    parser.add_argument("--h", type=int, default=720, help="渲染高")
-    parser.add_argument("--radius", type=float, default=None, help="轨道相机半径（默认由场景估计）")
-    parser.add_argument("--fov-y", type=float, default=60.0, help="垂直 FOV（度）")
-    parser.add_argument("--tau", type=float, default=0.05, help="cut_by_distance 阈值 tau")
+    parser = argparse.ArgumentParser(description="Flat-tree BRDF attr viewer with child_begin/child_count")
+    parser.add_argument("--lod-dir", type=Path, required=True, help="contains tree_index_flat.npz + lod_level_*.ply")
+    parser.add_argument("--w", type=int, default=1280)
+    parser.add_argument("--h", type=int, default=720)
+    parser.add_argument("--radius", type=float, default=None)
+    parser.add_argument("--fov-y", type=float, default=60.0)
+    parser.add_argument("--tau", type=float, default=0.05)
     args = parser.parse_args()
 
     lod_dir = args.lod_dir.resolve()
-    index_path = lod_dir / "tree_index.npz"
+    index_path = lod_dir / "tree_index_flat.npz"
     if not index_path.is_file():
-        raise SystemExit(f"未找到 {index_path}")
+        raise SystemExit(f"missing {index_path}")
 
     if not torch.cuda.is_available():
-        raise SystemExit("需要 CUDA 与已编译的 diff_gaussian_rasterization。")
+        raise SystemExit("CUDA is required.")
 
     device = torch.device("cuda")
-    tree = LODTree.load(index_path)
-    tree.build_index()
-
+    tree = FlatTree.load(index_path)
     plies = discover_lod_plies(lod_dir)
-    level_count = tree.root_level + 1
-    if len(plies) != level_count:
-        raise SystemExit(
-            f"PLY 层数 {len(plies)} 与 tree root_level+1={level_count} 不一致。"
-            f"请确认目录内有 level 0..{tree.root_level} 的 ply。"
-        )
+    if len(plies) != tree.root_level + 1:
+        raise SystemExit(f"ply levels={len(plies)} but root_level+1={tree.root_level + 1}")
 
-    print("加载各层 PLY → GPU …")
+    print("Loading BRDF multi-view ply levels to GPU...")
     level_tensors: List[Dict[str, torch.Tensor]] = []
     for p in plies:
         print(f"  {p.name}")
-        level_tensors.append(load_sh_ply_gaussians(p, device))
+        level_tensors.append(load_brdf_ply_multiview(p, device))
 
     scene_center = tree.node_xyz.mean(axis=0).astype(np.float64)
     extent = float(np.linalg.norm(tree.node_xyz.max(axis=0) - tree.node_xyz.min(axis=0)) + 1e-8)
@@ -313,45 +371,34 @@ def main() -> None:
     tanfovy = math.tan(fovy * 0.5)
     bg = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=device)
 
-    # Dear PyGui
     dpg.create_context()
-    dpg.create_viewport(title="LOD cut_by_distance (3DGS CUDA)", width=args.w + 320, height=args.h + 180)
+    dpg.create_viewport(title="Flat LOD Viewer (3DGS CUDA)", width=args.w + 320, height=args.h + 220)
 
     tex_w, tex_h = args.w, args.h
-    # 不同 Dear PyGui 版本格式常量名不一致；优先 float RGB（与当前 PyPI 文档一致）。
-    if getattr(dpg, "mvFormat_Float_rgb", None) is not None:
-        _fmt_rgb = dpg.mvFormat_Float_rgb
-        _tex_dtype = np.float32
-    else:
-        raise SystemExit(
-            "当前 dearpygui 未找到 RGB raw 纹理格式（mvFormat_Float_rgb / UChar / Int）。请升级 dearpygui。"
-        )
-    tex_buf = np.zeros(tex_w * tex_h * 3, dtype=_tex_dtype)
-
+    if getattr(dpg, "mvFormat_Float_rgb", None) is None:
+        raise SystemExit("dearpygui requires mvFormat_Float_rgb")
+    tex_buf = np.zeros(tex_w * tex_h * 3, dtype=np.float32)
     with dpg.texture_registry():
-        dpg.add_raw_texture(
-            tex_w,
-            tex_h,
-            default_value=tex_buf,
-            format=_fmt_rgb,
-            tag="render_tex",
-        )
+        dpg.add_raw_texture(tex_w, tex_h, default_value=tex_buf, format=dpg.mvFormat_Float_rgb, tag="render_tex")
 
     r_min = max(extent * 0.05, 0.05)
     r_max = max(extent * 8.0, r_min * 2.0, 5.0)
+    state = {"tau": float(args.tau), "fps": 0.0, "n_visible": 0}
+    attr_items = ["basecolor", "normal", "metallic", "roughness"]
 
-    state = {
-        "tau": float(args.tau),
-        "fps": 0.0,
-        "n_visible": 0,
-    }
-
-    with dpg.window(label="Main", tag="win_main", width=args.w + 40, height=args.h + 220):
+    with dpg.window(label="Main", tag="win_main", width=args.w + 30, height=args.h + 240):
         dpg.add_image("render_tex", tag="img_view")
         dpg.add_separator()
-        dpg.add_text("Camera (spherical around scene mean)")
+        dpg.add_text("Flat hierarchy cut: child_begin + child_count")
+        dpg.add_combo(
+            label="Channel",
+            items=attr_items,
+            default_value="basecolor",
+            tag="combo_attr",
+            width=200,
+        )
         dpg.add_slider_float(
-            label="Camera distance",
+            label="Distance",
             default_value=float(radius),
             min_value=r_min,
             max_value=r_max,
@@ -359,7 +406,7 @@ def main() -> None:
             tag="sl_radius",
         )
         dpg.add_slider_float(
-            label="Azimuth theta (deg around Z)",
+            label="Azimuth theta (deg)",
             default_value=0.0,
             min_value=-180.0,
             max_value=180.0,
@@ -368,23 +415,21 @@ def main() -> None:
         )
         dpg.add_slider_float(
             label="Polar phi (deg from +Z)",
-            default_value=60.0,
+            default_value=90.0,
             min_value=5.0,
             max_value=175.0,
             format="%.1f",
             tag="sl_phi_deg",
         )
-        dpg.add_separator()
-        dpg.add_text("LOD")
         dpg.add_slider_float(
-            label="cut threshold tau",
+            label="cut tau",
             default_value=state["tau"],
             min_value=0.001,
             max_value=0.5,
             format="%.4f",
             tag="sl_tau",
         )
-        dpg.add_text("status: ", tag="txt_status")
+        dpg.add_text("", tag="txt_status")
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -393,29 +438,31 @@ def main() -> None:
     except Exception:
         pass
 
-    print("窗口已打开。拖动滑块调节相机与 tau；按住 Q 退出。")
-
+    print("viewer started; drag sliders, hold Q to quit.")
     while dpg.is_dearpygui_running():
         if dpg.is_key_down(dpg.mvKey_Q):
             break
         t0 = time.perf_counter()
+        raw_attr = dpg.get_value("combo_attr")
+        if isinstance(raw_attr, int):
+            attr = attr_items[raw_attr] if 0 <= raw_attr < len(attr_items) else "basecolor"
+        else:
+            attr = str(raw_attr)
+        if attr not in ATTR_KEYS:
+            attr = "basecolor"
+
         cam_r = float(dpg.get_value("sl_radius"))
         theta = math.radians(float(dpg.get_value("sl_theta_deg")))
         phi = math.radians(float(dpg.get_value("sl_phi_deg")))
         state["tau"] = float(dpg.get_value("sl_tau"))
-
         eye = scene_center + cam_r * np.array(
-            [
-                math.sin(phi) * math.sin(theta),
-                math.sin(phi) * math.cos(theta),
-                math.cos(phi),
-            ],
+            [math.sin(phi) * math.sin(theta), math.sin(phi) * math.cos(theta), math.cos(phi)],
             dtype=np.float64,
         )
 
         cut = tree.cut_by_distance(eye, tau=state["tau"])
         state["n_visible"] = len(cut)
-        gauss = gather_gaussians_for_cut(tree, level_tensors, cut, device)
+        gauss = gather_gaussians_for_cut(tree, level_tensors, cut, device, attr)
 
         wvt, full_proj, cam_center = build_camera_tensors(
             eye.astype(np.float32),
@@ -428,20 +475,21 @@ def main() -> None:
             device,
         )
 
-        raster_settings = GaussianRasterizationSettings(
-            image_height=tex_h,
-            image_width=tex_w,
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg,
-            scale_modifier=1.0,
-            viewmatrix=wvt,
-            projmatrix=full_proj,
-            sh_degree=0,
-            campos=cam_center,
-            prefiltered=False,
+        rasterizer = GaussianRasterizer(
+            raster_settings=GaussianRasterizationSettings(
+                image_height=tex_h,
+                image_width=tex_w,
+                tanfovx=tanfovx,
+                tanfovy=tanfovy,
+                bg=bg,
+                scale_modifier=1.0,
+                viewmatrix=wvt,
+                projmatrix=full_proj,
+                sh_degree=0,
+                campos=cam_center,
+                prefiltered=False,
+            )
         )
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
         if gauss is None or gauss["num"] == 0:
             tex_buf[:] = 0
@@ -451,26 +499,20 @@ def main() -> None:
             im = img.detach().clamp(0, 1)
             if im.is_sparse:
                 im = im.to_dense()
-            # diff_gaussian_rasterization 常为 (1, 3, H, W)，去掉 batch 维再转成 HWC
             while im.dim() > 3:
                 im = im.squeeze(0)
             if im.dim() != 3:
-                raise RuntimeError(f"光栅化输出维度异常: shape={tuple(im.shape)}")
+                raise RuntimeError(f"bad render output shape={tuple(im.shape)}")
             rgb = im.permute(1, 2, 0).contiguous().cpu().numpy()
-            if _tex_dtype == np.float32:
-                tex_buf[:] = rgb.astype(np.float32, copy=False).ravel()
-            else:
-                tex_buf[:] = (rgb * 255.0).astype(np.uint8).ravel()
+            tex_buf[:] = rgb.astype(np.float32, copy=False).ravel()
 
         dpg.set_value("render_tex", tex_buf)
-
         dt = time.perf_counter() - t0
         state["fps"] = 0.9 * state["fps"] + 0.1 * (1.0 / dt if dt > 1e-6 else 0.0)
         dpg.set_value(
             "txt_status",
-            f"可见高斯: {state['n_visible']}  |  r={cam_r:.3f}  |  tau={state['tau']:.4f}  |  ~{state['fps']:.1f} fps",
+            f"attr={attr}  |  N={state['n_visible']}  |  r={cam_r:.3f}  tau={state['tau']:.4f}  |  ~{state['fps']:.1f} fps",
         )
-
         dpg.render_dearpygui_frame()
 
     dpg.destroy_context()
@@ -478,3 +520,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
