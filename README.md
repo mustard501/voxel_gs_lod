@@ -1,4 +1,4 @@
-# Mesh to 3DGS LOD
+# Voxel_GS_LOD
 
 将三角网格模型按多尺度体素进行采样，并导出多层高斯点云（`.ply`）。
 
